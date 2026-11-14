@@ -13,6 +13,8 @@ import xlsxwriter
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 from tqdm.auto import tqdm
+from xlsxwriter.format import Format
+from xlsxwriter.worksheet import Worksheet
 
 ACTION_TYPES = {
 	'Tor': 'goal',
@@ -317,6 +319,39 @@ def _save_dataset(path: Path, dataset: dict) -> None:
 	temporary.replace(path)
 
 
+def _league_table(data: dict, retrieved_at: str) -> dict:
+	"""Retain the complete official standings in source order, or mark them unavailable.
+
+	:param data: League API response containing the score section.
+	:param retrieved_at: Timestamp of the league response.
+	"""
+	rows = data['content'].get('score')
+	result = {'retrieved_at': retrieved_at, 'rows': [], 'error': 'No current league table available.'}
+	if not isinstance(rows, list) or not rows:
+		return result
+	fields = (
+		'numPlayedGames',
+		'numWonGames',
+		'numEqualGames',
+		'numLostGames',
+		'numGoalsShot',
+		'numGoalsGot',
+		'pointsPlus',
+		'pointsMinus',
+	)
+	for row in rows:
+		if (
+			not isinstance(row, dict)
+			or not isinstance(row.get('tabTeamname'), str)
+			or not row['tabTeamname'].strip()
+			or 'tabScore' not in row
+			or any(not re.fullmatch(r'-?\d+', str(row.get(field, '')).strip()) for field in fields)
+		):
+			result['error'] = 'Unreadable current league table.'
+			return result
+	return {'retrieved_at': retrieved_at, 'rows': rows, 'error': None}
+
+
 def enrich_actions(path: Path) -> dict:
 	"""Split saved action text and persist it without network or PDF access.
 
@@ -329,7 +364,7 @@ def enrich_actions(path: Path) -> dict:
 
 
 def sync_league(url: str, path: Path, refresh: bool = False) -> dict:
-	"""Incrementally save every completed league game and parse uncached PDF IDs.
+	"""Replace current standings, save completed games, and parse uncached PDF IDs.
 
 	:param url: BWHV league URL including its fragment parameters.
 	:param path: Destination JSON, also used as the persistent parsed-report cache.
@@ -361,6 +396,8 @@ def sync_league(url: str, path: Path, refresh: bool = False) -> dict:
 		data = response.json()[0]
 		dataset['league'] = data['head']['headline2']
 		dataset['updated_at'] = datetime.now(TIMEZONE).isoformat()
+		dataset['league_table'] = _league_table(data, dataset['updated_at'])
+		_save_dataset(path, dataset)
 		completed = [game for game in _games(data) if _completed(game)]
 		for game in tqdm(completed, desc=dataset['league'], unit='match'):
 			pdf_id = str(game.get('sGID', '')).strip()
@@ -550,10 +587,18 @@ def prepare_match(
 								'name': _name(player['name']),
 								'number': _starting_number(player),
 								'total_goals': 0,
+								'total_seven_m_scored': 0,
+								'total_yellow_cards': 0,
+								'total_two_min_penalties': 0,
+								'total_red_cards': 0,
 								'games': 0,
 							},
 						)
 						combined['total_goals'] += player['goals']
+						combined['total_seven_m_scored'] += player['seven_m_scored']
+						combined['total_yellow_cards'] += player['yellow_cards']
+						combined['total_two_min_penalties'] += player['two_min_penalties']
+						combined['total_red_cards'] += player['red_cards']
 						combined['games'] += 1
 					for official in roster['officials']:
 						officials.setdefault((official['name'].strip(), official['role']), official)
@@ -598,8 +643,85 @@ def format_preparation(result: dict) -> str:
 	return '\n'.join(lines)
 
 
+def _print_page(sheet: Worksheet, last_row: int, last_column: int) -> None:
+	"""Set a worksheet's printable area to one A4 portrait page.
+
+	:param sheet: Worksheet to configure.
+	:param last_row: Last printable row, zero-based.
+	:param last_column: Last printable column, zero-based.
+	"""
+	sheet.print_area(0, 0, last_row, last_column)
+	sheet.set_paper(9)
+	sheet.set_portrait()
+	sheet.fit_to_pages(1, 1)
+	sheet.set_margins(0.25, 0.25, 0.3, 0.3)
+	sheet.center_horizontally()
+
+
+def _export_league_table(
+	sheet: Worksheet, result: dict, heading: Format, header: Format, body: Format, number: Format
+) -> None:
+	"""Write standings and both teams' selected results to one printable sheet.
+
+	:param sheet: Destination worksheet.
+	:param result: Match preparation including a league_table snapshot.
+	:param heading: Title format.
+	:param header: Column header format.
+	:param body: Team name format.
+	:param number: Numeric cell format.
+	"""
+	table: dict = result.get('league_table') or {'rows': [], 'error': 'No current league table available.'}
+	sheet.hide_gridlines(2)
+	sheet.set_default_row(24)
+	for column, width in enumerate((6, 35, 6, 5, 5, 5, 13, 8, 10)):
+		sheet.set_column(column, column, width)
+	sheet.set_row(0, 40)
+	sheet.merge_range(0, 0, 0, 8, result['league'], heading)
+	sheet.merge_range(1, 0, 1, 8, 'Aktuelle offizielle Tabelle', body)
+	stamp = table.get('retrieved_at')
+	retrieved = (
+		datetime.fromisoformat(stamp).strftime('%d.%m.%Y %H:%M %Z') if isinstance(stamp, str) else 'unbekannt'
+	)
+	sheet.merge_range(2, 0, 2, 8, f'Abgerufen: {retrieved}', body)
+	sheet.write_row(4, 0, ['Platz', 'Mannschaft', 'Sp.', 'S', 'U', 'N', 'Tore', 'Diff.', 'Punkte'], header)
+	rows = table['rows']
+	for index, team in enumerate(rows, 5):
+		sheet.set_row(index, 30)
+		position = str(team['tabScore'])
+		if position.isdigit():
+			sheet.write_number(index, 0, int(position), number)
+		else:
+			sheet.write_string(index, 0, position, body)
+		sheet.write_string(index, 1, team['tabTeamname'], body)
+		for column, field in enumerate(('numPlayedGames', 'numWonGames', 'numEqualGames', 'numLostGames'), 2):
+			sheet.write_number(index, column, int(team[field]), number)
+		sheet.write_string(index, 6, f'{team["numGoalsShot"]}:{team["numGoalsGot"]}', number)
+		sheet.write_number(index, 7, int(team['numGoalsShot']) - int(team['numGoalsGot']), number)
+		sheet.write_string(index, 8, f'{team["pointsPlus"]}:{team["pointsMinus"]}', number)
+	if table['error']:
+		sheet.merge_range(5, 0, 5, 8, f'Tabelle nicht verfügbar: {table["error"]}', body)
+	row = max(7, len(rows) + 6)
+	for team in result['teams']:
+		reports = team.get('reports', [])
+		sheet.merge_range(row, 0, row, 8, f'{team["team"]} – letzte Spiele ({len(reports)})', header)
+		row += 1
+		if not reports:
+			sheet.merge_range(row, 0, row, 8, 'Keine vorherigen abgeschlossenen Ligaspiele.', body)
+			row += 1
+		for report in reports:
+			game = report['match']
+			sheet.set_row(row, 30)
+			sheet.merge_range(
+				row, 0, row, 6, f'{game["gDate"]}  {game["gHomeTeam"]} – {game["gGuestTeam"]}', body
+			)
+			sheet.merge_range(row, 7, row, 8, f'{game["gHomeGoals"]}:{game["gGuestGoals"]}', number)
+			row += 1
+		row += 1
+	_print_page(sheet, row - 2, 8)
+
+
 def export_matches(preparations: dict[str, dict], next_date: date, excel_path: Path) -> Path | None:
-	"""Export the selected day's player lists with space for handwritten additions.
+	"""Export player lists and latest standings, each sheet fitted to one A4 page.
 
 	:param preparations: Match preparations keyed by worksheet name.
 	:param next_date: Match day used for worksheet filtering.
@@ -659,33 +781,59 @@ def export_matches(preparations: dict[str, dict], next_date: date, excel_path: P
 				'valign': 'vcenter',
 			}
 		)
+		table_heading = workbook.add_format(
+			{'font_name': 'Arial', 'font_size': 13, 'bold': True, 'text_wrap': True, 'valign': 'vcenter'}
+		)
+		table_body = workbook.add_format(
+			{
+				'font_name': 'Arial',
+				'font_size': 11,
+				'text_wrap': True,
+				'valign': 'vcenter',
+				'bottom': 1,
+				'bottom_color': '#D9DEE3',
+			}
+		)
+		# Reserve names without creating sheets so each table follows its player sheet.
+		sheet_names = {label.casefold() for label in selected}
 		for label, result in selected.items():
 			sheet = workbook.add_worksheet(label)
 			sheet.hide_gridlines(2)
 			sheet.set_default_row(21.5)
 			sheet.set_row(0, 10)
 			sheet.set_row(1, 30)
-			for column, width in enumerate((6, 30, 7, 7, 3, 6, 30, 7, 7)):
+			for column, width in enumerate((4, 26, 7, 11, 5, 6, 5, 3, 4, 26, 7, 11, 5, 6, 5)):
 				sheet.set_column(column, column, width)
 			last_row = max(len(team['players']) for team in result['teams']) + 10
 			for index, team in enumerate(result['teams']):
-				column = index * 5
-				sheet.merge_range(1, column, 1, column + 3, team['team'], heading)
-				sheet.write_row(2, column, ['Nr.', 'Spieler', 'Tore', 'Spiele'], header)
+				column = index * 8
+				sheet.merge_range(1, column, 1, column + 6, team['team'], heading)
+				sheet.write_row(
+					2, column, ['Nr.', 'Spieler', 'Spiele', 'Tore (7m)', 'Gelb', '2 min', 'Rot'], header
+				)
 				for row, player in enumerate(team['players'], 3):
 					sheet.write_number(row, column, player['number'], number)
 					sheet.write_string(row, column + 1, player['name'], body)
-					sheet.write_number(row, column + 2, player['total_goals'], number)
-					sheet.write_number(row, column + 3, player['games'], number)
+					sheet.write_number(row, column + 2, player['games'], number)
+					sheet.write_string(
+						row, column + 3, f'{player["total_goals"]} ({player["total_seven_m_scored"]})', number
+					)
+					sheet.write_number(row, column + 4, player['total_yellow_cards'], number)
+					sheet.write_number(row, column + 5, player['total_two_min_penalties'], number)
+					sheet.write_number(row, column + 6, player['total_red_cards'], number)
 				for row in range(len(team['players']) + 3, len(team['players']) + 11):
-					for offset in range(4):
+					for offset in range(7):
 						sheet.write_blank(row, column + offset, None, body if offset == 1 else number)
-				sheet.print_area(0, 0, last_row, 8)
-				sheet.set_paper(9)
-				sheet.set_portrait()
-				sheet.fit_to_pages(1, 1)
-				sheet.set_margins(0.25, 0.25, 0.3, 0.3)
-				sheet.center_horizontally()
+			_print_page(sheet, last_row, 14)
+			table_name = f'{label[:23]}_TABELLE'
+			index = 2
+			while table_name.casefold() in sheet_names:
+				table_name = f'{label[:20]}_TABELLE_{index}'
+				index += 1
+			sheet_names.add(table_name.casefold())
+			_export_league_table(
+				workbook.add_worksheet(table_name), result, table_heading, header, table_body, number
+			)
 	return path
 
 
@@ -724,6 +872,8 @@ def run_match_day(
 			url = config['url']
 			squad = config['team']
 			dataset = sync_league(url, Path('matches') / season / f'bwhv_{label}.json', refresh=refresh)
+			if dataset['league_table']['error']:
+				print(f'League table unavailable: {dataset["league_table"]["error"]}')
 			issues = [game for game in dataset['games'].values() if game['error']]
 			print(f'Saved {len(dataset["games"])} official results; {len(issues)} unavailable reports.')
 			for game in issues:
@@ -737,6 +887,7 @@ def run_match_day(
 		if preparation is None:
 			print(f'No match on {next_date}.')
 			continue
+		preparation['league_table'] = dataset['league_table']
 		preparations[label] = preparation
 		print(format_preparation(preparation))
 	output_path = export_matches(preparations, match_day, excel_path)

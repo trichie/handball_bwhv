@@ -26,6 +26,22 @@ Labels must be valid Excel worksheet names and suitable filename components. The
 
 League caches are saved to `matches/<season>/bwhv_<label>.json`. The default workbook destination is `output/matches_<next_date>.xlsx`; parent folders are created automatically. Existing destination workbooks are overwritten when an export is produced. If no preparations match the selected day, no workbook is written and any existing workbook remains.
 
+Each cache also contains `league_table` with the full official standings rows, retrieval timestamp, and any availability error. Every successful league fetch replaces this snapshot, even with `refresh` set to `false`. Standings represent the latest data fetched, not a prediction for the fixture date. Missing or unreadable standings clear the old snapshot and are reported explicitly.
+
+## Edit and print
+
+Each exported match has a player sheet and a separate `<label>_TABELLE` sheet with the latest official league standings. Every sheet is configured as one A4 portrait page with a print area and scaling to one page wide by one page tall.
+
+Player columns are `Nr.`, `Spieler`, `Spiele`, `Tore (7m)`, `Gelb`, `2 min`, `Rot`. `Tore (7m)` displays total goals with scored seven-metre goals in parentheses, such as `42 (8)`. Goals and disciplinary counts are totals from the selected readable match reports.
+
+Below the standings, both teams' previous results appear newest first, with date, home team, away team, and final score in home:away order. These use the same `n_matches` selection as player preparation: `null` includes all eligible games, including results whose PDFs are unavailable. No games are omitted to fit the page; long histories make the one-page print smaller.
+
+Sheets follow the configured team order, with each player sheet immediately followed by its standings sheet: `MAENNER`, `MAENNER_TABELLE`, `FRAUEN`, `FRAUEN_TABELLE`, and so on. Export the entire workbook in this order and print the PDF double-sided, flipping on the long edge, to put each player list and its table on the front and back of the same piece of paper.
+
+Make manual corrections in Excel, then export or print the **entire workbook** to PDF using the saved print areas and scaling. Use the blank player rows for additions. If you add content outside a print area, extend that sheet's print area first; keep A4 paper and fit-to-one-page scaling. Check PDF print preview after edits, especially after adding rows or enlarging fonts, since fitting more content can reduce readability. The script produces Excel, and PDF export is a manual step.
+
+If standings are unavailable, their sheet shows a warning and player sheets remain available. Long worksheet labels are shortened for standings sheet names, and conflicting derived names receive a suffix.
+
 Read console output for unavailable reports and partial preparations. Historical rosters do not guarantee the actual match-day lineup; confirm names and jersey numbers before announcing. A roster appearance means the player was listed, not necessarily that they played.
 
 ## Maintenance
