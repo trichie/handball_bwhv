@@ -1,0 +1,21 @@
+{
+  "teams": {
+    "MAENNER": {
+      "team": "TSV 1848 Bad Saulgau",
+      "url": "https://www.bwhv.org/spielbetrieb/ergebnisse/tabellen#/league?ogId=216&lId=161176&allGames=1"
+    },
+    "FRAUEN": {
+      "team": "TSV 1848 Bad Saulgau",
+      "url": "https://www.bwhv.org/spielbetrieb/ergebnisse/tabellen#/league?ogId=216&lId=166276&allGames=1"
+    },
+    "ZWEITE": {
+      "team": "TSV 1848 Bad Saulgau 2",
+      "url": "https://www.bwhv.org/spielbetrieb/ergebnisse/tabellen#/league?ogId=216&lId=166246&allGames=1"
+    }
+  },
+  "season": "2026_2027",
+  "next_date": "2026-11-14",
+  "excel_path": "output/matches_{next_date}.xlsx",
+  "n_matches": null,
+  "refresh": false
+}

@@ -1,0 +1,80 @@
+[project]
+name = "handball_bwhv"
+version = "0.1.0"
+description = "Prepare handball announcer rosters and match-day Excel sheets from public BWHV reports."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "pypdf>=7.1.0",
+	"tqdm>=4.67.1",
+    "xlsxwriter>=3.2.9",
+]
+
+[tool.ruff]
+line-length = 110
+exclude = [
+	".bzr",
+	".direnv",
+	".eggs",
+	".git",
+	".git-rewrite",
+	".hg",
+	".ipynb_checkpoints",
+	".mypy_cache",
+	".nox",
+	".pants.d",
+	".pyenv",
+	".pytest_cache",
+	".pytype",
+	".ruff_cache",
+	".svn",
+	".tox",
+	".venv",
+	".vscode",
+	"__pypackages__",
+	"_build",
+	"buck-out",
+	"build",
+	"dist",
+	"node_modules",
+	"site-packages",
+	"venv",
+	"./not_used/*"
+]
+
+[tool.ruff.lint]
+select = [
+	"E",    # pycodestyle
+	"F",    # Pyflakes
+	"UP",   # pyupgrade
+	"B",    # flake8-bugbear
+	"SIM",  # flake8-simplify
+	"I",    # isort
+	"S",    # flake8-bandit security checks
+]
+fixable = ["ALL"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "tab"
+docstring-code-format = true
+
+[tool.ty.src]
+exclude = ["*.ipynb"]
+
+[tool.pyright]
+reportArgumentType = "none"
+reportOptionalMemberAccess = "none"
+reportUnsupportedDunderAll = "none"
+reportCallIssue = "none"
+reportOptionalSubscript = "none"
+reportAttributeAccessIssue = "none"
+reportPossiblyUnboundVariable = "none"
+reportGeneralTypeIssues = "none"
+reportOptionalIterable = "none"
+reportOperatorIssue = "none"
+reportOptionalOperand = "none"
+reportOptionalCall = "none"
+reportFunctionMemberAccess = "none"
