@@ -1,6 +1,6 @@
 [project]
 name = "handball_bwhv"
-version = "0.2.0"
+version = "0.3.0"
 description = "Prepare handball announcer rosters and match-day Excel sheets from public BWHV reports."
 readme = "README.md"
 requires-python = ">=3.13"

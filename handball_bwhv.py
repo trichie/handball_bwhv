@@ -5,6 +5,7 @@ import re
 from datetime import date, datetime
 from io import BytesIO
 from pathlib import Path
+from textwrap import wrap
 from urllib.parse import parse_qs, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -264,6 +265,7 @@ def parse_report(pdf: bytes) -> dict:
 
 
 API_URL = 'https://spo.handball4all.de/service/if_g_json.php'
+PROJECT_URL = 'https://github.com/trichie/handball_bwhv'
 TIMEZONE = ZoneInfo('Europe/Zurich')
 
 
@@ -364,7 +366,7 @@ def enrich_actions(path: Path) -> dict:
 
 
 def sync_league(url: str, path: Path, refresh: bool = False) -> dict:
-	"""Replace current standings, save completed games, and parse uncached PDF IDs.
+	"""Replace standings, save completed/cancelled games, and parse uncached reports.
 
 	:param url: BWHV league URL including its fragment parameters.
 	:param path: Destination JSON, also used as the persistent parsed-report cache.
@@ -398,7 +400,9 @@ def sync_league(url: str, path: Path, refresh: bool = False) -> dict:
 		dataset['updated_at'] = datetime.now(TIMEZONE).isoformat()
 		dataset['league_table'] = _league_table(data, dataset['updated_at'])
 		_save_dataset(path, dataset)
-		completed = [game for game in _games(data) if _completed(game)]
+		completed = [
+			game for game in _games(data) if _completed(game) or _cancelled(game.get('gComment', ''))
+		]
 		for game in tqdm(completed, desc=dataset['league'], unit='match'):
 			pdf_id = str(game.get('sGID', '')).strip()
 			if pdf_id in ('', '0'):
@@ -413,14 +417,18 @@ def sync_league(url: str, path: Path, refresh: bool = False) -> dict:
 				'start': start.isoformat() if start else None,
 				'home': {
 					'team': game['gHomeTeam'],
-					'goals': int(game['gHomeGoals']),
+					'goals': int(game['gHomeGoals'])
+					if str(game.get('gHomeGoals', '')).strip().isdigit()
+					else None,
 					'points': int(game['gHomePoints'])
 					if str(game.get('gHomePoints', '')).strip().isdigit()
 					else None,
 				},
 				'away': {
 					'team': game['gGuestTeam'],
-					'goals': int(game['gGuestGoals']),
+					'goals': int(game['gGuestGoals'])
+					if str(game.get('gGuestGoals', '')).strip().isdigit()
+					else None,
 					'points': int(game['gGuestPoints'])
 					if str(game.get('gGuestPoints', '')).strip().isdigit()
 					else None,
@@ -471,6 +479,78 @@ def sync_league(url: str, path: Path, refresh: bool = False) -> dict:
 	return dataset
 
 
+def _scorer_ranking(
+	games: list[dict],
+	reports: dict,
+	before: datetime,
+	teams: tuple[str, str],
+	scorer_top_n: int = 10,
+	scorer_per_team: int = 3,
+) -> dict:
+	"""Aggregate season statistics and select league leaders plus each team's best scorers.
+
+	:param games: League fixtures, retaining their API team aliases.
+	:param reports: Parsed reports keyed by PDF ID.
+	:param before: Exclusive kickoff cutoff for the ranking.
+	:param teams: Configured team and opponent fixture aliases.
+	:param scorer_top_n: Number of league leaders to include.
+	:param scorer_per_team: Minimum number of scorers to include per participating team, if available.
+	"""
+	statistics = ('goals', 'seven_m_scored', 'yellow_cards', 'two_min_penalties', 'red_cards')
+	players: dict = {}
+	missing = 0
+	readable = 0
+	for game in games:
+		if (
+			not _completed(game)
+			or _cancelled(game.get('gComment', ''))
+			or (start := _start(game)) is None
+			or start >= before
+		):
+			continue
+		report = reports.get(str(game.get('sGID', '')).strip())
+		if not report or report.get('status') != 'ok':
+			missing += 1
+			continue
+		readable += 1
+		for side, fixture_team in (('home', game['gHomeTeam']), ('away', game['gGuestTeam'])):
+			for player in report[side]['players']:
+				name = _name(player['name'])
+				combined = players.setdefault(
+					(fixture_team, name),
+					{
+						'name': name,
+						'club': report[side]['team'],
+						'team_alias': fixture_team,
+						'games': 0,
+						**{f'total_{field}': 0 for field in statistics},
+					},
+				)
+				combined['games'] += 1
+				for field in statistics:
+					combined[f'total_{field}'] += player[field]
+	ordered = sorted(
+		players.values(), key=lambda player: (-player['total_goals'], player['club'], player['name'])
+	)
+	previous_goals = None
+	rank = 0
+	for index, player in enumerate(ordered, 1):
+		if player['total_goals'] != previous_goals:
+			rank = index
+		player['rank'] = rank
+		previous_goals = player['total_goals']
+	selected = set(range(min(scorer_top_n, len(ordered))))
+	for team in teams:
+		selected.update(
+			[index for index, player in enumerate(ordered) if player['team_alias'] == team][:scorer_per_team]
+		)
+	return {
+		'rows': [player for index, player in enumerate(ordered) if index in selected],
+		'readable_reports': readable,
+		'missing_reports': missing,
+	}
+
+
 def prepare_match(
 	url: str,
 	team: str,
@@ -478,20 +558,27 @@ def prepare_match(
 	n_matches: int | None = None,
 	dataset: dict | None = None,
 	match_date: date | None = None,
+	scorer_top_n: int = 10,
+	scorer_per_team: int = 3,
 ) -> dict | None:
 	"""Find the next fixture and combine recent rosters with goals and appearances.
 
 	:param url: BWHV league URL including its fragment parameters.
 	:param team: Exact full team name from the BWHV team list.
 	:param now: Aware lookup time; defaults to current Europe/Zurich time.
-	:param n_matches: Positive number of latest played matches, or None for all.
-	:param dataset: Optional synced league dataset; reuse its parsed reports.
+	:param n_matches: Positive number of latest completed or cancelled matches, or None for all.
+	:param dataset: Optional synced league dataset; reuse its parsed reports and build season scorer rankings.
 	:param match_date: Select this calendar day instead of the next future match; return None if absent.
+	:param scorer_top_n: Positive number of league leaders to include in the scorer ranking; defaults to 10.
+	:param scorer_per_team: Positive number of scorers to include per participating team; defaults to 3.
 	"""
 	if n_matches is not None and (
 		isinstance(n_matches, bool) or not isinstance(n_matches, int) or n_matches < 1
 	):
 		raise ValueError('n_matches must be a positive integer or None.')
+	for name, value in (('scorer_top_n', scorer_top_n), ('scorer_per_team', scorer_per_team)):
+		if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+			raise ValueError(f'{name} must be a positive integer.')
 	now = now or datetime.now(TIMEZONE)
 	if now.utcoffset() is None:
 		raise ValueError('now must include a timezone.')
@@ -537,7 +624,28 @@ def prepare_match(
 			raise ValueError(f'No next scheduled match with a known kickoff found for {team}.')
 		next_start, next_game = min(future, key=lambda candidate: candidate[0])
 		opponent = next(name for name in _teams(next_game) if name != alias)
-		result = {'league': data['head']['headline2'], 'next_match': next_game, 'teams': []}
+		result = {
+			'league': data['head']['headline2'],
+			'next_match': next_game,
+			'teams': [],
+			'team_alias': alias,
+			'upcoming_matches': [],
+		}
+		upcoming = [
+			(start, game)
+			for game in games
+			if alias in _teams(game)
+			and (start := _start(game)) is not None
+			and start > next_start
+			and start > now
+			and not _completed(game)
+			and not game['live']
+			and not _cancelled(game.get('gComment', ''))
+		]
+		for _, game in sorted(upcoming, key=lambda candidate: candidate[0]):
+			result['upcoming_matches'].append(game)
+			if game['gHomeTeam'] == alias:
+				break
 		for name in (alias, opponent):
 			entry: dict = {'team': name, 'players': [], 'officials': [], 'reports': [], 'error': None}
 			result['teams'].append(entry)
@@ -545,20 +653,22 @@ def prepare_match(
 				game
 				for game in games
 				if name in _teams(game)
-				and _completed(game)
-				and not _cancelled(game.get('gComment', ''))
+				and (_completed(game) or _cancelled(game.get('gComment', '')))
 				and (start := _start(game)) is not None
 				and start < now
 				and start < next_start
 			]
 			if not past:
-				entry['error'] = 'No previous completed league match found.'
+				entry['error'] = 'No previous completed or cancelled league match found.'
 				continue
 			players = {}
 			officials = {}
 			for game in sorted(past, key=lambda game: _start(game), reverse=True)[:n_matches]:
 				report = {'match': game, 'pdf_url': None, 'error': None}
 				entry['reports'].append(report)
+				if _cancelled(game.get('gComment', '')):
+					report['error'] = f'Cancelled match: {game["gComment"].strip()}'
+					continue
 				if str(game.get('sGID', 0)).strip() in ('', '0'):
 					report['error'] = 'No public PDF report.'
 					continue
@@ -580,6 +690,7 @@ def prepare_match(
 					roster = rosters[side]
 					entry['team'] = roster['team']
 					for player in roster['players']:
+						# Reports are newest first; older appearances must not replace the jersey number.
 						combined = players.setdefault(
 							_name(player['name']),
 							{
@@ -609,6 +720,10 @@ def prepare_match(
 				officials.values(), key=lambda official: (official['role'], official['name'])
 			)
 
+		if dataset is not None:
+			result['scorer_ranking'] = _scorer_ranking(
+				games, dataset['reports'], next_start, (alias, opponent), scorer_top_n, scorer_per_team
+			)
 	return result
 
 
@@ -640,6 +755,10 @@ def format_preparation(result: dict) -> str:
 			lines.append(entry['error'])
 		lines.append('Team officials:')
 		lines.extend(f'  {p["role"]}  {p["name"]}' for p in entry['officials'])
+	lines.extend(['', f'{result["teams"][0]["team"]} – nächste Spiele:'])
+	lines.extend(_label(game) for game in result.get('upcoming_matches', []))
+	if not result.get('upcoming_matches'):
+		lines.append('Keine weiteren angesetzten Ligaspiele.')
 	return '\n'.join(lines)
 
 
@@ -659,9 +778,16 @@ def _print_page(sheet: Worksheet, last_row: int, last_column: int) -> None:
 
 
 def _export_league_table(
-	sheet: Worksheet, result: dict, heading: Format, header: Format, body: Format, number: Format
+	sheet: Worksheet,
+	result: dict,
+	heading: Format,
+	header: Format,
+	body: Format,
+	number: Format,
+	away_label: Format,
+	standings_headers: dict[str, Format],
 ) -> None:
-	"""Write standings and both teams' selected results to one printable sheet.
+	"""Write standings, both teams' results, and the configured team's upcoming games.
 
 	:param sheet: Destination worksheet.
 	:param result: Match preparation including a league_table snapshot.
@@ -669,55 +795,183 @@ def _export_league_table(
 	:param header: Column header format.
 	:param body: Team name format.
 	:param number: Numeric cell format.
+	:param away_label: Centered format for away-game labels.
+	:param standings_headers: League-table header formats keyed by horizontal alignment.
 	"""
 	table: dict = result.get('league_table') or {'rows': [], 'error': 'No current league table available.'}
 	sheet.hide_gridlines(2)
-	sheet.set_default_row(24)
-	for column, width in enumerate((6, 35, 6, 5, 5, 5, 13, 8, 10)):
-		sheet.set_column(column, column, width)
-	sheet.set_row(0, 40)
-	sheet.merge_range(0, 0, 0, 8, result['league'], heading)
-	sheet.merge_range(1, 0, 1, 8, 'Aktuelle offizielle Tabelle', body)
+	sheet.set_default_row(18)
+	# A narrow blank column separates the equal-width history tables.
+	sheet.set_column(0, 18, 5.2)
+	sheet.set_column(9, 9, 3)
+	standings_columns = ((0, 0), (1, 6), (7, 7), (8, 8), (9, 10), (11, 11), (12, 14), (15, 16), (17, 18))
+	sheet.set_row(0, max(24, len(wrap(result['league'], width=105)) * 15))
+	sheet.set_row(3, 6)
+	sheet.merge_range(0, 0, 0, 18, result['league'], heading)
+	sheet.merge_range(1, 0, 1, 18, 'Aktuelle offizielle Tabelle', body)
 	stamp = table.get('retrieved_at')
 	retrieved = (
 		datetime.fromisoformat(stamp).strftime('%d.%m.%Y %H:%M %Z') if isinstance(stamp, str) else 'unbekannt'
 	)
-	sheet.merge_range(2, 0, 2, 8, f'Abgerufen: {retrieved}', body)
-	sheet.write_row(4, 0, ['Platz', 'Mannschaft', 'Sp.', 'S', 'U', 'N', 'Tore', 'Diff.', 'Punkte'], header)
+	sheet.merge_range(2, 0, 2, 18, f'Abgerufen: {retrieved}', body)
+	for column, label in enumerate(('Platz', 'Mannschaft', 'Sp.', 'S', 'U', 'N', 'Tore', 'Diff.', 'Punkte')):
+		left, right = standings_columns[column]
+		cell_format = standings_headers['left' if column == 1 else 'right']
+		if left == right:
+			sheet.write(4, left, label, cell_format)
+		else:
+			sheet.merge_range(4, left, 4, right, label, cell_format)
 	rows = table['rows']
 	for index, team in enumerate(rows, 5):
-		sheet.set_row(index, 30)
+		sheet.set_row(index, max(18, len(wrap(team['tabTeamname'], width=36)) * 15))
 		position = str(team['tabScore'])
-		if position.isdigit():
-			sheet.write_number(index, 0, int(position), number)
-		else:
-			sheet.write_string(index, 0, position, body)
-		sheet.write_string(index, 1, team['tabTeamname'], body)
-		for column, field in enumerate(('numPlayedGames', 'numWonGames', 'numEqualGames', 'numLostGames'), 2):
-			sheet.write_number(index, column, int(team[field]), number)
-		sheet.write_string(index, 6, f'{team["numGoalsShot"]}:{team["numGoalsGot"]}', number)
-		sheet.write_number(index, 7, int(team['numGoalsShot']) - int(team['numGoalsGot']), number)
-		sheet.write_string(index, 8, f'{team["pointsPlus"]}:{team["pointsMinus"]}', number)
+		values = [
+			int(position) if position.isdigit() else position,
+			team['tabTeamname'],
+			int(team['numPlayedGames']),
+			int(team['numWonGames']),
+			int(team['numEqualGames']),
+			int(team['numLostGames']),
+			f'{team["numGoalsShot"]}:{team["numGoalsGot"]}',
+			int(team['numGoalsShot']) - int(team['numGoalsGot']),
+			f'{team["pointsPlus"]}:{team["pointsMinus"]}',
+		]
+		for column, value in enumerate(values):
+			left, right = standings_columns[column]
+			cell_format = body if column == 1 else number
+			if left == right:
+				sheet.write(index, left, value, cell_format)
+			else:
+				sheet.merge_range(index, left, index, right, value, cell_format)
 	if table['error']:
-		sheet.merge_range(5, 0, 5, 8, f'Tabelle nicht verfügbar: {table["error"]}', body)
-	row = max(7, len(rows) + 6)
-	for team in result['teams']:
+		warning = f'Tabelle nicht verfügbar: {table["error"]}'
+		sheet.set_row(5, max(18, len(wrap(warning, width=120)) * 15))
+		sheet.merge_range(5, 0, 5, 18, warning, body)
+	history_row = max(7, len(rows) + 6)
+	sheet.set_row(history_row - 1, 6)
+	row_heights = {history_row: 18}
+	history_end = history_row + 1
+	for index, team in enumerate(result['teams']):
+		column = index * 10
+		row = history_row
 		reports = team.get('reports', [])
-		sheet.merge_range(row, 0, row, 8, f'{team["team"]} – letzte Spiele ({len(reports)})', header)
+		label = f'{team["team"]} – letzte Spiele ({len(reports)})'
+		row_heights[row] = max(row_heights[row], len(wrap(label, width=48)) * 15)
+		sheet.merge_range(row, column, row, column + 8, label, header)
 		row += 1
 		if not reports:
-			sheet.merge_range(row, 0, row, 8, 'Keine vorherigen abgeschlossenen Ligaspiele.', body)
+			sheet.merge_range(
+				row,
+				column,
+				row,
+				column + 8,
+				'Keine vorherigen abgeschlossenen oder abgesagten Ligaspiele.',
+				body,
+			)
+			row_heights[row] = max(row_heights.get(row, 0), 30)
 			row += 1
 		for report in reports:
 			game = report['match']
-			sheet.set_row(row, 30)
-			sheet.merge_range(
-				row, 0, row, 6, f'{game["gDate"]}  {game["gHomeTeam"]} – {game["gGuestTeam"]}', body
-			)
-			sheet.merge_range(row, 7, row, 8, f'{game["gHomeGoals"]}:{game["gGuestGoals"]}', number)
+			cancelled = _cancelled(game.get('gComment', ''))
+			text = f'{game["gDate"]}  {game["gHomeTeam"]} – {game["gGuestTeam"]}'
+			if cancelled:
+				text += f'\n{game["gComment"].strip()}'
+			lines = sum(max(1, len(wrap(line, width=42))) for line in text.splitlines())
+			row_heights[row] = max(row_heights.get(row, 0), 18, lines * 15)
+			sheet.merge_range(row, column, row, column + 6, text, body)
+			score = 'Abgesagt' if cancelled else f'{game["gHomeGoals"]}:{game["gGuestGoals"]}'
+			sheet.merge_range(row, column + 7, row, column + 8, score, number)
 			row += 1
+		history_end = max(history_end, row)
+	for row, height in row_heights.items():
+		sheet.set_row(row, height)
+	sheet.set_row(history_end, 6)
+	row = history_end + 1
+	label = f'{result["teams"][0]["team"]} – nächste Spiele'
+	sheet.set_row(row, max(18, len(wrap(label, width=120)) * 15))
+	sheet.merge_range(row, 0, row, 18, label, header)
+	row += 1
+	upcoming = result.get('upcoming_matches', [])
+	if not upcoming:
+		sheet.merge_range(row, 0, row, 18, 'Keine weiteren angesetzten Ligaspiele.', body)
 		row += 1
-	_print_page(sheet, row - 2, 8)
+	for game in upcoming:
+		label = _label(game)
+		sheet.set_row(row, max(18, len(wrap(label, width=100)) * 15))
+		sheet.merge_range(row, 0, row, 14, label, body)
+		home = game['gHomeTeam'] == result['team_alias']
+		sheet.merge_range(row, 15, row, 18, 'Heim' if home else 'Auswärts', header if home else away_label)
+		row += 1
+	_print_page(sheet, row - 1, 18)
+
+
+def _export_scorer_ranking(
+	sheet: Worksheet,
+	result: dict,
+	row: int,
+	heading: Format,
+	header: Format,
+	body: Format,
+	number: Format,
+	active_formats: tuple[Format, Format],
+) -> int:
+	"""Append season scorer statistics and return the last printable row.
+
+	:param sheet: Player worksheet.
+	:param result: Preparation including a season scorer ranking.
+	:param row: First row for the ranking section.
+	:param heading: Section title format.
+	:param header: Column header format.
+	:param body: Player and club text format.
+	:param number: Numeric cell format.
+	:param active_formats: Bold text and numeric formats for the two participating teams.
+	"""
+	sheet.set_row(row, 24)
+	sheet.merge_range(row, 0, row, 14, 'Torschützen – Saison vor dem ausgewählten Spiel', heading)
+	row += 1
+	ranking = result.get('scorer_ranking')
+	if ranking is None:
+		sheet.merge_range(
+			row, 0, row, 14, 'Torschützenliste nicht verfügbar: zuerst Liga synchronisieren.', body
+		)
+		return row
+	missing = ranking['missing_reports']
+	note = f'Basis: {ranking["readable_reports"]} lesbare Spielberichte.'
+	if missing:
+		note += f' Unvollständig: {missing} Spielberichte fehlen oder sind nicht lesbar.'
+	sheet.set_row(row, max(18, len(wrap(note, width=120)) * 15))
+	sheet.merge_range(row, 0, row, 14, note, body)
+	row += 1
+	columns = ((0, 0), (1, 9), (10, 10), (11, 11), (12, 12), (13, 13), (14, 14))
+	sheet.set_row(row, 21.5)
+	for (left, right), label in zip(
+		columns, ('Rg.', 'Spieler (Verein)', 'Spiele', 'Tore (7m)', 'Gelb', '2 min', 'Rot'), strict=True
+	):
+		if left == right:
+			sheet.write(row, left, label, header)
+		else:
+			sheet.merge_range(row, left, row, right, label, header)
+	row += 1
+	if not ranking['rows']:
+		sheet.merge_range(row, 0, row, 14, 'Keine auswertbaren Spielerdaten vorhanden.', body)
+		return row
+	active_teams = _teams(result['next_match'])
+	for player in ranking['rows']:
+		player_body, player_number = (
+			active_formats if player['team_alias'] in active_teams else (body, number)
+		)
+		player_label = f'{player["name"]} ({player["club"]})'
+		sheet.set_row(row, max(18, len(wrap(player_label, width=100)) * 15))
+		sheet.write_number(row, 0, player['rank'], player_number)
+		sheet.merge_range(row, 1, row, 9, player_label, player_body)
+		sheet.write_number(row, 10, player['games'], player_number)
+		sheet.write_string(
+			row, 11, f'{player["total_goals"]} ({player["total_seven_m_scored"]})', player_number
+		)
+		for column, field in enumerate(('yellow_cards', 'two_min_penalties', 'red_cards'), 12):
+			sheet.write_number(row, column, player[f'total_{field}'], player_number)
+		row += 1
+	return row - 1
 
 
 def export_matches(preparations: dict[str, dict], next_date: date, excel_path: Path) -> Path | None:
@@ -777,12 +1031,38 @@ def export_matches(preparations: dict[str, dict], next_date: date, excel_path: P
 				'font_size': 11,
 				'bold': True,
 				'bg_color': '#EDF0F3',
+				'text_wrap': True,
 				'align': 'center',
 				'valign': 'vcenter',
 			}
 		)
 		table_heading = workbook.add_format(
 			{'font_name': 'Arial', 'font_size': 13, 'bold': True, 'text_wrap': True, 'valign': 'vcenter'}
+		)
+		standings_headers = {
+			alignment: workbook.add_format(
+				{
+					'font_name': 'Arial',
+					'font_size': 11,
+					'bold': True,
+					'bg_color': '#EDF0F3',
+					'text_wrap': True,
+					'align': alignment,
+					'valign': 'vcenter',
+				}
+			)
+			for alignment in ('left', 'right')
+		}
+		away_label = workbook.add_format(
+			{
+				'font_name': 'Arial',
+				'font_size': 11,
+				'align': 'center',
+				'valign': 'vcenter',
+				'bottom': 1,
+				'bottom_color': '#D9DEE3',
+				'font_color': '#17202A',
+			}
 		)
 		table_body = workbook.add_format(
 			{
@@ -794,24 +1074,60 @@ def export_matches(preparations: dict[str, dict], next_date: date, excel_path: P
 				'bottom_color': '#D9DEE3',
 			}
 		)
+		active_formats = (
+			workbook.add_format(
+				{
+					'font_name': 'Arial',
+					'font_size': 11,
+					'bold': True,
+					'text_wrap': True,
+					'valign': 'vcenter',
+					'bottom': 1,
+					'bottom_color': '#D9DEE3',
+				}
+			),
+			workbook.add_format(
+				{
+					'font_name': 'Arial',
+					'font_size': 11,
+					'bold': True,
+					'font_color': '#17202A',
+					'valign': 'vcenter',
+					'align': 'right',
+					'num_format': '0',
+					'bottom': 1,
+					'bottom_color': '#D9DEE3',
+				}
+			),
+		)
+		credit_format = workbook.add_format(
+			{'font_name': 'Arial', 'font_size': 9, 'font_color': '#59636E', 'valign': 'vcenter'}
+		)
 		# Reserve names without creating sheets so each table follows its player sheet.
 		sheet_names = {label.casefold() for label in selected}
 		for label, result in selected.items():
 			sheet = workbook.add_worksheet(label)
 			sheet.hide_gridlines(2)
 			sheet.set_default_row(21.5)
-			sheet.set_row(0, 10)
-			sheet.set_row(1, 30)
+			sheet.set_row(0, max(24, len(wrap(f'Matchblatt – {result["league"]}', width=105)) * 15))
+			sheet.set_row(1, max(18, len(wrap(_label(result['next_match']), width=120)) * 15))
+			sheet.set_row(2, 14)
+			sheet.set_row(3, 24)
 			for column, width in enumerate((4, 26, 7, 11, 5, 6, 5, 3, 4, 26, 7, 11, 5, 6, 5)):
 				sheet.set_column(column, column, width)
-			last_row = max(len(team['players']) for team in result['teams']) + 10
+			sheet.merge_range(0, 0, 0, 14, f'Matchblatt – {result["league"]}', table_heading)
+			sheet.merge_range(1, 0, 1, 14, _label(result['next_match']), table_body)
+			credit = f'-- powered by {PROJECT_URL}'
+			sheet.merge_range(2, 0, 2, 14, credit, credit_format)
+			sheet.write_url(2, 0, PROJECT_URL, credit_format, credit)
+			last_row = max(len(team['players']) for team in result['teams']) + 9
 			for index, team in enumerate(result['teams']):
 				column = index * 8
-				sheet.merge_range(1, column, 1, column + 6, team['team'], heading)
+				sheet.merge_range(3, column, 3, column + 6, team['team'], heading)
 				sheet.write_row(
-					2, column, ['Nr.', 'Spieler', 'Spiele', 'Tore (7m)', 'Gelb', '2 min', 'Rot'], header
+					4, column, ['Nr.', 'Spieler', 'Spiele', 'Tore (7m)', 'Gelb', '2 min', 'Rot'], header
 				)
-				for row, player in enumerate(team['players'], 3):
+				for row, player in enumerate(team['players'], 5):
 					sheet.write_number(row, column, player['number'], number)
 					sheet.write_string(row, column + 1, player['name'], body)
 					sheet.write_number(row, column + 2, player['games'], number)
@@ -821,9 +1137,12 @@ def export_matches(preparations: dict[str, dict], next_date: date, excel_path: P
 					sheet.write_number(row, column + 4, player['total_yellow_cards'], number)
 					sheet.write_number(row, column + 5, player['total_two_min_penalties'], number)
 					sheet.write_number(row, column + 6, player['total_red_cards'], number)
-				for row in range(len(team['players']) + 3, len(team['players']) + 11):
+				for row in range(len(team['players']) + 5, len(team['players']) + 10):
 					for offset in range(7):
 						sheet.write_blank(row, column + offset, None, body if offset == 1 else number)
+			last_row = _export_scorer_ranking(
+				sheet, result, last_row + 1, table_heading, header, table_body, number, active_formats
+			)
 			_print_page(sheet, last_row, 14)
 			table_name = f'{label[:23]}_TABELLE'
 			index = 2
@@ -832,7 +1151,14 @@ def export_matches(preparations: dict[str, dict], next_date: date, excel_path: P
 				index += 1
 			sheet_names.add(table_name.casefold())
 			_export_league_table(
-				workbook.add_worksheet(table_name), result, table_heading, header, table_body, number
+				workbook.add_worksheet(table_name),
+				result,
+				table_heading,
+				header,
+				table_body,
+				number,
+				away_label,
+				standings_headers,
 			)
 	return path
 
@@ -854,6 +1180,8 @@ def run_match_day(
 	excel_path: Path,
 	n_matches: int | None = None,
 	refresh: bool = False,
+	scorer_top_n: int = 10,
+	scorer_per_team: int = 3,
 ) -> tuple[dict[str, dict], Path | None]:
 	"""Sync configured leagues, prepare the selected day, and export its workbook.
 
@@ -861,8 +1189,10 @@ def run_match_day(
 	:param season: Existing season folder name below matches.
 	:param next_date: Match day in ISO YYYY-MM-DD format.
 	:param excel_path: Full destination path for the generated workbook.
-	:param n_matches: Positive number of recent played matches, or None for all.
+	:param n_matches: Positive number of recent completed or cancelled matches, or None for all.
 	:param refresh: Reparse successful cached reports as well.
+	:param scorer_top_n: Positive number of league leaders to include in the scorer ranking; defaults to 10.
+	:param scorer_per_team: Positive number of scorers to include per participating team; defaults to 3.
 	"""
 	match_day = date.fromisoformat(next_date)
 	preparations = {}
@@ -879,7 +1209,13 @@ def run_match_day(
 			for game in issues:
 				print(f'  Game {game["game_id"]}: {game["error"]}')
 			preparation = prepare_match(
-				url, squad, n_matches=n_matches, dataset=dataset, match_date=match_day
+				url,
+				squad,
+				n_matches=n_matches,
+				dataset=dataset,
+				match_date=match_day,
+				scorer_top_n=scorer_top_n,
+				scorer_per_team=scorer_per_team,
 			)
 		except (httpx.HTTPError, ValueError, KeyError, PyPdfError) as exc:
 			print(f'Preparation unavailable: {exc}')

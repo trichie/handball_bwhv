@@ -14,8 +14,10 @@
     }
   },
   "season": "2026_2027",
-  "next_date": "2026-11-14",
+  "next_date": "2026-11-28",
   "excel_path": "output/matches_{next_date}.xlsx",
   "n_matches": null,
+  "scorer_top_n": 10,
+  "scorer_per_team": 3,
   "refresh": false
 }
